@@ -60,11 +60,11 @@ type Conn struct {
 	writeMsgCtx    context.Context
 	readMsgLeft    int64
 
+	// readMsgLock is acquired to read from bw.
+	readMsgLock chan struct{}
 	// Used to ensure the previous reader is read till EOF before allowing
 	// a new one.
-	previousReader *messageReader
-	// readFrameLock is acquired to read from bw.
-	readFrameLock     chan struct{}
+	previousReader    *messageReader
 	readClosed        int64
 	readHeaderBuf     []byte
 	controlPayloadBuf []byte
@@ -90,7 +90,7 @@ func (c *Conn) init() {
 	c.writeMsgLock = make(chan struct{}, 1)
 	c.writeFrameLock = make(chan struct{}, 1)
 
-	c.readFrameLock = make(chan struct{}, 1)
+	c.readMsgLock = make(chan struct{}, 1)
 
 	c.setReadTimeout = make(chan context.Context)
 	c.setWriteTimeout = make(chan context.Context)
@@ -134,7 +134,7 @@ func (c *Conn) close(err error) {
 			// Whenever a caller holds this lock and calls close, it ensures to release the lock to prevent
 			// a deadlock.
 			// As of now, this is in writeFrame, readFramePayload and readHeader.
-			c.readFrameLock <- struct{}{}
+			c.readMsgLock <- struct{}{}
 			returnBufioReader(c.br)
 
 			c.writeFrameLock <- struct{}{}
@@ -170,7 +170,7 @@ func (c *Conn) acquireLock(ctx context.Context, lock chan struct{}) error {
 		switch lock {
 		case c.writeFrameLock, c.writeMsgLock:
 			err = xerrors.Errorf("could not acquire write lock: %v", ctx.Err())
-		case c.readFrameLock:
+		case c.readMsgLock:
 			err = xerrors.Errorf("could not acquire read lock: %v", ctx.Err())
 		default:
 			panic(fmt.Sprintf("websocket: failed to acquire unknown lock: %v", ctx.Err()))
@@ -224,13 +224,8 @@ func (c *Conn) readTillMsg(ctx context.Context) (header, error) {
 	}
 }
 
+// Assumes the caller has acquired readMsgLock.
 func (c *Conn) readFrameHeader(ctx context.Context) (header, error) {
-	err := c.acquireLock(context.Background(), c.readFrameLock)
-	if err != nil {
-		return header{}, err
-	}
-	defer c.releaseLock(c.readFrameLock)
-
 	select {
 	case <-c.closed:
 		return header{}, c.closeErr
@@ -247,7 +242,7 @@ func (c *Conn) readFrameHeader(ctx context.Context) (header, error) {
 		default:
 		}
 		err := xerrors.Errorf("failed to read header: %w", err)
-		c.releaseLock(c.readFrameLock)
+		c.releaseLock(c.readMsgLock)
 		c.close(err)
 		return header{}, err
 	}
@@ -344,6 +339,12 @@ func (c *Conn) Reader(ctx context.Context) (MessageType, io.Reader, error) {
 }
 
 func (c *Conn) reader(ctx context.Context) (MessageType, io.Reader, error) {
+	err := c.acquireLock(context.Background(), c.readMsgLock)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer c.releaseLock(c.readMsgLock)
+
 	if c.previousReader != nil && !c.readFrameEOF {
 		// The only way we know for sure the previous reader is not yet complete is
 		// if there is an active frame not yet fully read.
@@ -435,6 +436,12 @@ func (r *messageReader) Read(p []byte) (int, error) {
 }
 
 func (r *messageReader) read(p []byte) (int, error) {
+	err := r.c.acquireLock(r.c.readMsgCtx, r.c.readMsgLock)
+	if err != nil {
+		return 0, err
+	}
+	defer r.c.releaseLock(r.c.readMsgLock)
+
 	if r.eof {
 		return 0, xerrors.Errorf("cannot use EOFed reader")
 	}
@@ -496,13 +503,8 @@ func (r *messageReader) read(p []byte) (int, error) {
 	return n, nil
 }
 
+// Assumes the caller has acquired readMsgLock.
 func (c *Conn) readFramePayload(ctx context.Context, p []byte) (int, error) {
-	err := c.acquireLock(ctx, c.readFrameLock)
-	if err != nil {
-		return 0, err
-	}
-	defer c.releaseLock(c.readFrameLock)
-
 	select {
 	case <-c.closed:
 		return 0, c.closeErr
@@ -519,7 +521,7 @@ func (c *Conn) readFramePayload(ctx context.Context, p []byte) (int, error) {
 		default:
 		}
 		err = xerrors.Errorf("failed to read frame payload: %w", err)
-		c.releaseLock(c.readFrameLock)
+		c.releaseLock(c.readMsgLock)
 		c.close(err)
 		return n, err
 	}
@@ -839,18 +841,34 @@ func (c *Conn) exportedClose(code StatusCode, reason string) error {
 		return err
 	}
 
-	const to = time.Second * 10
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
 
-	t := time.NewTimer(to)
-	defer t.Stop()
-
-	// Wait for the close frame to be read.
-	select {
-	case <-c.closed:
-	case <-t.C:
-		c.close(xerrors.Errorf("sent close frame (%v) but did not receive close frame from peer in %v", ce, to))
+	err = c.acquireLock(ctx, c.readMsgLock)
+	if err != nil {
+		return err
 	}
-	return c.closeErr
+	defer c.releaseLock(c.readMsgLock)
+
+	discardBytes := func(n int64) {
+		// TODO avoid allocating the 32kb buffer every time.
+		io.Copy(ioutil.Discard, io.LimitReader(c.br, n))
+	}
+
+	if c.previousReader != nil && !c.readFrameEOF {
+		// We need to discard the remaining bytes of the in progress reader.
+		discardBytes(c.readMsgHeader.payloadLength)
+	}
+
+	// TODO rate limit this loop somehow.
+	for {
+		h, err := c.readTillMsg(ctx)
+		if err != nil {
+			return err
+		}
+
+		discardBytes(h.payloadLength)
+	}
 }
 
 func (c *Conn) writeClose(p []byte) error {

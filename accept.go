@@ -28,8 +28,7 @@ type AcceptOptions struct {
 
 	// InsecureSkipVerify is used to disable Accept's origin verification behaviour.
 	//
-	// Deprecated: Use OriginPatterns with a match all pattern of * instead to control
-	// origin authorization yourself.
+	// You probably want to use OriginPatterns instead.
 	InsecureSkipVerify bool
 
 	// OriginPatterns lists the host patterns for authorized origins.
@@ -46,6 +45,9 @@ type AcceptOptions struct {
 	//
 	// Please ensure you understand the ramifications of enabling this.
 	// If used incorrectly your WebSocket server will be open to CSRF attacks.
+	//
+	// Do not use * as a pattern to allow any origin, prefer to use InsecureSkipVerify instead
+	// to bring attention to the danger of such a setting.
 	OriginPatterns []string
 
 	// CompressionMode controls the compression mode.
@@ -65,7 +67,7 @@ type AcceptOptions struct {
 // the connection to a WebSocket.
 //
 // Accept will not allow cross origin requests by default.
-// See the InsecureSkipVerify option to allow cross origin requests.
+// See the InsecureSkipVerify and OriginPatterns options to allow cross origin requests.
 //
 // Accept will write a response to w on all errors.
 func Accept(w http.ResponseWriter, r *http.Request, opts *AcceptOptions) (*Conn, error) {
@@ -122,6 +124,12 @@ func accept(w http.ResponseWriter, r *http.Request, opts *AcceptOptions) (_ *Con
 	}
 
 	w.WriteHeader(http.StatusSwitchingProtocols)
+	// See https://github.com/nhooyr/websocket/issues/166
+	if ginWriter, ok := w.(interface {
+		WriteHeaderNow()
+	}); ok {
+		ginWriter.WriteHeaderNow()
+	}
 
 	netConn, brw, err := hj.Hijack()
 	if err != nil {
